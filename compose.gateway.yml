@@ -1,0 +1,90 @@
+# EC2-1 (gateway node): API gateway, registration, login and the Nginx load balancer.
+# Run from the repository root on EC2-1:
+#   docker compose -f compose.gateway.yml up -d --build
+# Values come from .env in the same folder (see .env.gateway.example).
+# Only port 8000 (the API gateway) is published to the outside world.
+
+name: fitcore-gateway
+
+x-service: &service
+  restart: unless-stopped
+  init: true
+  networks: [backend]
+  logging:
+    driver: json-file
+    options: { max-size: "10m", max-file: "3" }
+  deploy:
+    resources:
+      limits: { cpus: "0.50", memory: 192M }
+
+x-common-env: &common-env
+  NODE_ENV: production
+  INSTANCE_NAME: ec2-1-gateway
+  INTERNAL_API_KEY: ${INTERNAL_API_KEY:?Set INTERNAL_API_KEY in .env}
+
+services:
+  api-gateway:
+    <<: *service
+    build: ./api-gateway
+    image: fitcore/api-gateway:1.0.0
+    ports:
+      - "8000:8000"
+    environment:
+      <<: *common-env
+      PORT: 8000
+      JWT_SECRET: ${JWT_SECRET:?Set JWT_SECRET in .env}
+      REGISTRATION_URL: http://registration-service:8001
+      LOGIN_URL: http://login-service:8002
+      MEMBERSHIP_URL: http://load-balancer:8003
+      PAYMENT_URL: http://load-balancer:8004
+      CLASS_URL: http://load-balancer:8005
+      BOOKING_URL: http://load-balancer:8006
+      TRAINER_URL: http://load-balancer:8007
+      ATTENDANCE_URL: http://load-balancer:8008
+    depends_on:
+      registration-service: { condition: service_healthy }
+      login-service: { condition: service_healthy }
+      load-balancer: { condition: service_healthy }
+
+  registration-service:
+    <<: *service
+    build: ./registration-service
+    image: fitcore/registration-service:1.0.0
+    environment:
+      <<: *common-env
+      PORT: 8001
+      MONGO_URI: ${MONGO_URI:?Set MONGO_URI in .env}
+      MONGO_DB_NAME: fitcore_identity
+      SEED_ADMIN_NAME: ${SEED_ADMIN_NAME:?Set SEED_ADMIN_NAME in .env}
+      SEED_ADMIN_EMAIL: ${SEED_ADMIN_EMAIL:?Set SEED_ADMIN_EMAIL in .env}
+      SEED_ADMIN_PASSWORD: ${SEED_ADMIN_PASSWORD:?Set SEED_ADMIN_PASSWORD in .env}
+
+  login-service:
+    <<: *service
+    build: ./login-service
+    image: fitcore/login-service:1.0.0
+    environment:
+      <<: *common-env
+      PORT: 8002
+      MONGO_URI: ${MONGO_URI:?Set MONGO_URI in .env}
+      MONGO_DB_NAME: fitcore_identity
+      JWT_SECRET: ${JWT_SECRET:?Set JWT_SECRET in .env}
+      JWT_EXPIRES_IN: 2h
+
+  # Round-robin load balancer for the six business services on EC2-2 and EC2-3.
+  load-balancer:
+    <<: *service
+    image: nginx:1.27-alpine
+    volumes:
+      - ./nginx/templates:/etc/nginx/templates:ro
+    environment:
+      NODE_A_HOST: ${NODE_A_HOST:?Set NODE_A_HOST (EC2-2 private IP) in .env}
+      NODE_B_HOST: ${NODE_B_HOST:?Set NODE_B_HOST (EC2-3 private IP) in .env}
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
+networks:
+  backend:

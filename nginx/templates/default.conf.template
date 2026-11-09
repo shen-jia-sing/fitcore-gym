@@ -1,0 +1,110 @@
+# FitCore load balancer (runs on EC2-1, next to the API gateway).
+#
+# Every business service runs twice: once on service node A (EC2-2) and once on
+# service node B (EC2-3). Nginx listens on the same port as each service and spreads
+# requests round-robin across both nodes.
+#
+# NODE_A_HOST / NODE_B_HOST are filled in from environment variables when the
+# container starts (the official nginx image runs envsubst on /etc/nginx/templates).
+#
+# The shared zone keeps one round-robin counter and one failure count for all
+# Nginx worker processes.
+#
+# Failover: if a node refuses the connection, times out, or answers 502/503/504,
+# Nginx retries the request on the other node (only for safe cases: a non-idempotent
+# request is retried only if it never reached the first node) and marks the failing
+# node as down for 10s after 2 failures.
+
+upstream membership_service {
+    zone membership_service 64k;
+    server ${NODE_A_HOST}:8003 max_fails=2 fail_timeout=10s;
+    server ${NODE_B_HOST}:8003 max_fails=2 fail_timeout=10s;
+    keepalive 16;
+}
+
+upstream payment_service {
+    zone payment_service 64k;
+    server ${NODE_A_HOST}:8004 max_fails=2 fail_timeout=10s;
+    server ${NODE_B_HOST}:8004 max_fails=2 fail_timeout=10s;
+    keepalive 16;
+}
+
+upstream class_service {
+    zone class_service 64k;
+    server ${NODE_A_HOST}:8005 max_fails=2 fail_timeout=10s;
+    server ${NODE_B_HOST}:8005 max_fails=2 fail_timeout=10s;
+    keepalive 16;
+}
+
+upstream booking_service {
+    zone booking_service 64k;
+    server ${NODE_A_HOST}:8006 max_fails=2 fail_timeout=10s;
+    server ${NODE_B_HOST}:8006 max_fails=2 fail_timeout=10s;
+    keepalive 16;
+}
+
+upstream trainer_service {
+    zone trainer_service 64k;
+    server ${NODE_A_HOST}:8007 max_fails=2 fail_timeout=10s;
+    server ${NODE_B_HOST}:8007 max_fails=2 fail_timeout=10s;
+    keepalive 16;
+}
+
+upstream attendance_service {
+    zone attendance_service 64k;
+    server ${NODE_A_HOST}:8008 max_fails=2 fail_timeout=10s;
+    server ${NODE_B_HOST}:8008 max_fails=2 fail_timeout=10s;
+    keepalive 16;
+}
+
+# Settings shared by every proxied request
+proxy_http_version 1.1;
+proxy_set_header Connection "";
+proxy_set_header Host $host;
+proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+proxy_connect_timeout 2s;
+proxy_read_timeout 15s;
+proxy_next_upstream error timeout http_502 http_503 http_504;
+proxy_next_upstream_tries 2;
+
+# Shows which node answered (e.g. 172.31.5.20:8003). After a failover it lists both.
+add_header X-Upstream-Addr $upstream_addr always;
+
+server {
+    listen 8003;
+    location / { proxy_pass http://membership_service; }
+}
+
+server {
+    listen 8004;
+    location / { proxy_pass http://payment_service; }
+}
+
+server {
+    listen 8005;
+    location / { proxy_pass http://class_service; }
+}
+
+server {
+    listen 8006;
+    location / { proxy_pass http://booking_service; }
+}
+
+server {
+    listen 8007;
+    location / { proxy_pass http://trainer_service; }
+}
+
+server {
+    listen 8008;
+    location / { proxy_pass http://attendance_service; }
+}
+
+# Health check for the load balancer container itself
+server {
+    listen 8080;
+    location = /health {
+        default_type application/json;
+        return 200 '{"service":"load-balancer","status":"ok"}';
+    }
+}

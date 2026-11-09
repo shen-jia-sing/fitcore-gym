@@ -1,0 +1,254 @@
+# Local all-in-one stack (Docker Desktop): the same 3-machine layout on one computer.
+#   docker compose -f compose.local.yml up -d --build
+#   Postman baseUrl: http://localhost:8000
+#
+# "node-a" and "node-b" stand in for EC2-2 and EC2-3. Each one owns a network
+# namespace that its six services share (network_mode: service:node-x), so -
+# exactly like a real EC2 host - every service on that node is reachable at
+# node-x:<port>, and services on the same node talk to each other over 127.0.0.1.
+# MongoDB runs in a container here; on AWS you use MongoDB Atlas instead.
+
+name: fitcore-local
+
+x-base: &base
+  restart: unless-stopped
+  init: true
+  logging:
+    driver: json-file
+    options: { max-size: "10m", max-file: "3" }
+
+x-service: &service
+  <<: *base
+  networks: [backend]
+
+x-secrets: &secrets
+  NODE_ENV: production
+  INTERNAL_API_KEY: ${INTERNAL_API_KEY:?Set INTERNAL_API_KEY in .env}
+  MONGO_URI: mongodb://mongo:27017
+
+x-needs-mongo: &needs-mongo
+  mongo: { condition: service_healthy }
+
+x-membership: &membership
+  <<: *base
+  build: ./membership-service
+  image: fitcore/membership-service:1.0.0
+  depends_on: *needs-mongo
+x-membership-env: &membership-env
+  <<: *secrets
+  PORT: 8003
+  MONGO_DB_NAME: fitcore_membership
+
+x-payment: &payment
+  <<: *base
+  build: ./payment-service
+  image: fitcore/payment-service:1.0.0
+  depends_on: *needs-mongo
+x-payment-env: &payment-env
+  <<: *secrets
+  PORT: 8004
+  MONGO_DB_NAME: fitcore_payment
+  MEMBERSHIP_SERVICE_URL: http://127.0.0.1:8003
+
+x-class: &class
+  <<: *base
+  build: ./class-service
+  image: fitcore/class-service:1.0.0
+  depends_on: *needs-mongo
+x-class-env: &class-env
+  <<: *secrets
+  PORT: 8005
+  MONGO_DB_NAME: fitcore_class
+  TRAINER_SERVICE_URL: http://127.0.0.1:8007
+
+x-booking: &booking
+  <<: *base
+  build: ./booking-service
+  image: fitcore/booking-service:1.0.0
+  depends_on: *needs-mongo
+x-booking-env: &booking-env
+  <<: *secrets
+  PORT: 8006
+  MONGO_DB_NAME: fitcore_booking
+  CLASS_SERVICE_URL: http://127.0.0.1:8005
+
+x-trainer: &trainer
+  <<: *base
+  build: ./trainer-service
+  image: fitcore/trainer-service:1.0.0
+  depends_on: *needs-mongo
+x-trainer-env: &trainer-env
+  <<: *secrets
+  PORT: 8007
+  MONGO_DB_NAME: fitcore_trainer
+
+x-attendance: &attendance
+  <<: *base
+  build: ./attendance-service
+  image: fitcore/attendance-service:1.0.0
+  depends_on: *needs-mongo
+x-attendance-env: &attendance-env
+  <<: *secrets
+  PORT: 8008
+  MONGO_DB_NAME: fitcore_attendance
+  MEMBERSHIP_SERVICE_URL: http://127.0.0.1:8003
+
+services:
+  # ---------- database ----------
+  mongo:
+    <<: *service
+    image: mongo:7
+    ports: ["27017:27017"]   # connect MongoDB Compass to mongodb://localhost:27017
+    volumes: [mongo-data:/data/db]
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ---------- "EC2-1": gateway node ----------
+  api-gateway:
+    <<: *service
+    build: ./api-gateway
+    image: fitcore/api-gateway:1.0.0
+    ports: ["8000:8000"]
+    environment:
+      NODE_ENV: production
+      PORT: 8000
+      INSTANCE_NAME: local-gateway
+      INTERNAL_API_KEY: ${INTERNAL_API_KEY:?Set INTERNAL_API_KEY in .env}
+      JWT_SECRET: ${JWT_SECRET:?Set JWT_SECRET in .env}
+      REGISTRATION_URL: http://registration-service:8001
+      LOGIN_URL: http://login-service:8002
+      MEMBERSHIP_URL: http://load-balancer:8003
+      PAYMENT_URL: http://load-balancer:8004
+      CLASS_URL: http://load-balancer:8005
+      BOOKING_URL: http://load-balancer:8006
+      TRAINER_URL: http://load-balancer:8007
+      ATTENDANCE_URL: http://load-balancer:8008
+    depends_on:
+      registration-service: { condition: service_healthy }
+      login-service: { condition: service_healthy }
+      load-balancer: { condition: service_healthy }
+
+  registration-service:
+    <<: *service
+    build: ./registration-service
+    image: fitcore/registration-service:1.0.0
+    environment:
+      <<: *secrets
+      PORT: 8001
+      INSTANCE_NAME: local-gateway
+      MONGO_DB_NAME: fitcore_identity
+      SEED_ADMIN_NAME: ${SEED_ADMIN_NAME:?Set SEED_ADMIN_NAME in .env}
+      SEED_ADMIN_EMAIL: ${SEED_ADMIN_EMAIL:?Set SEED_ADMIN_EMAIL in .env}
+      SEED_ADMIN_PASSWORD: ${SEED_ADMIN_PASSWORD:?Set SEED_ADMIN_PASSWORD in .env}
+    depends_on: *needs-mongo
+
+  login-service:
+    <<: *service
+    build: ./login-service
+    image: fitcore/login-service:1.0.0
+    environment:
+      <<: *secrets
+      PORT: 8002
+      INSTANCE_NAME: local-gateway
+      MONGO_DB_NAME: fitcore_identity
+      JWT_SECRET: ${JWT_SECRET:?Set JWT_SECRET in .env}
+      JWT_EXPIRES_IN: 2h
+    depends_on: *needs-mongo
+
+  load-balancer:
+    <<: *service
+    image: nginx:1.27-alpine
+    volumes:
+      - ./nginx/templates:/etc/nginx/templates:ro
+    environment:
+      NODE_A_HOST: node-a
+      NODE_B_HOST: node-b
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+    depends_on:
+      membership-a: { condition: service_healthy }
+      payment-a: { condition: service_healthy }
+      class-a: { condition: service_healthy }
+      booking-a: { condition: service_healthy }
+      trainer-a: { condition: service_healthy }
+      attendance-a: { condition: service_healthy }
+      membership-b: { condition: service_healthy }
+      payment-b: { condition: service_healthy }
+      class-b: { condition: service_healthy }
+      booking-b: { condition: service_healthy }
+      trainer-b: { condition: service_healthy }
+      attendance-b: { condition: service_healthy }
+
+  # ---------- "EC2-2": service node A ----------
+  node-a:
+    <<: *service
+    image: node:22-alpine
+    command: ["tail", "-f", "/dev/null"]
+
+  membership-a:
+    <<: *membership
+    network_mode: service:node-a
+    environment: { <<: *membership-env, INSTANCE_NAME: node-a }
+  payment-a:
+    <<: *payment
+    network_mode: service:node-a
+    environment: { <<: *payment-env, INSTANCE_NAME: node-a }
+  class-a:
+    <<: *class
+    network_mode: service:node-a
+    environment: { <<: *class-env, INSTANCE_NAME: node-a }
+  booking-a:
+    <<: *booking
+    network_mode: service:node-a
+    environment: { <<: *booking-env, INSTANCE_NAME: node-a }
+  trainer-a:
+    <<: *trainer
+    network_mode: service:node-a
+    environment: { <<: *trainer-env, INSTANCE_NAME: node-a }
+  attendance-a:
+    <<: *attendance
+    network_mode: service:node-a
+    environment: { <<: *attendance-env, INSTANCE_NAME: node-a }
+
+  # ---------- "EC2-3": service node B ----------
+  node-b:
+    <<: *service
+    image: node:22-alpine
+    command: ["tail", "-f", "/dev/null"]
+
+  membership-b:
+    <<: *membership
+    network_mode: service:node-b
+    environment: { <<: *membership-env, INSTANCE_NAME: node-b }
+  payment-b:
+    <<: *payment
+    network_mode: service:node-b
+    environment: { <<: *payment-env, INSTANCE_NAME: node-b }
+  class-b:
+    <<: *class
+    network_mode: service:node-b
+    environment: { <<: *class-env, INSTANCE_NAME: node-b }
+  booking-b:
+    <<: *booking
+    network_mode: service:node-b
+    environment: { <<: *booking-env, INSTANCE_NAME: node-b }
+  trainer-b:
+    <<: *trainer
+    network_mode: service:node-b
+    environment: { <<: *trainer-env, INSTANCE_NAME: node-b }
+  attendance-b:
+    <<: *attendance
+    network_mode: service:node-b
+    environment: { <<: *attendance-env, INSTANCE_NAME: node-b }
+
+volumes:
+  mongo-data:
+
+networks:
+  backend:

@@ -1,0 +1,100 @@
+# EC2-2 and EC2-3 (service nodes): the six business microservices.
+# The same file runs on both nodes; NODE_NAME in .env (node-a / node-b) tells them apart.
+# Run from the repository root on each node:
+#   docker compose -f compose.node.yml up -d --build
+# Ports 8003-8008 must be reachable from EC2-1 only (security group), never from the internet.
+
+name: fitcore-node
+
+x-service: &service
+  restart: unless-stopped
+  init: true
+  networks: [backend]
+  logging:
+    driver: json-file
+    options: { max-size: "10m", max-file: "3" }
+  deploy:
+    resources:
+      limits: { cpus: "0.25", memory: 160M }
+
+x-common-env: &common-env
+  NODE_ENV: production
+  INSTANCE_NAME: ${NODE_NAME:?Set NODE_NAME (node-a or node-b) in .env}
+  INTERNAL_API_KEY: ${INTERNAL_API_KEY:?Set INTERNAL_API_KEY in .env}
+  MONGO_URI: ${MONGO_URI:?Set MONGO_URI in .env}
+
+services:
+  membership-service:
+    <<: *service
+    build: ./membership-service
+    image: fitcore/membership-service:1.0.0
+    ports: ["8003:8003"]
+    environment:
+      <<: *common-env
+      PORT: 8003
+      MONGO_DB_NAME: fitcore_membership
+
+  payment-service:
+    <<: *service
+    build: ./payment-service
+    image: fitcore/payment-service:1.0.0
+    ports: ["8004:8004"]
+    environment:
+      <<: *common-env
+      PORT: 8004
+      MONGO_DB_NAME: fitcore_payment
+      MEMBERSHIP_SERVICE_URL: http://membership-service:8003
+    depends_on:
+      membership-service: { condition: service_healthy }
+
+  class-service:
+    <<: *service
+    build: ./class-service
+    image: fitcore/class-service:1.0.0
+    ports: ["8005:8005"]
+    environment:
+      <<: *common-env
+      PORT: 8005
+      MONGO_DB_NAME: fitcore_class
+      TRAINER_SERVICE_URL: http://trainer-service:8007
+    depends_on:
+      trainer-service: { condition: service_healthy }
+
+  booking-service:
+    <<: *service
+    build: ./booking-service
+    image: fitcore/booking-service:1.0.0
+    ports: ["8006:8006"]
+    environment:
+      <<: *common-env
+      PORT: 8006
+      MONGO_DB_NAME: fitcore_booking
+      CLASS_SERVICE_URL: http://class-service:8005
+    depends_on:
+      class-service: { condition: service_healthy }
+
+  trainer-service:
+    <<: *service
+    build: ./trainer-service
+    image: fitcore/trainer-service:1.0.0
+    ports: ["8007:8007"]
+    environment:
+      <<: *common-env
+      PORT: 8007
+      MONGO_DB_NAME: fitcore_trainer
+
+  attendance-service:
+    <<: *service
+    build: ./attendance-service
+    image: fitcore/attendance-service:1.0.0
+    ports: ["8008:8008"]
+    environment:
+      <<: *common-env
+      PORT: 8008
+      MONGO_DB_NAME: fitcore_attendance
+      MEMBERSHIP_SERVICE_URL: http://membership-service:8003
+    depends_on:
+      membership-service: { condition: service_healthy }
+
+networks:
+  backend:
